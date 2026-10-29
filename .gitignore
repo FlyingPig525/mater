@@ -1,10 +1,6 @@
-# Devenv
-.devenv*
-devenv.local.nix
-devenv.local.yaml
+zig-out/
+.zig-cache/
+.devenv
+zig-pkg/
+log.log
 
-# direnv
-.direnv
-
-# pre-commit
-.pre-commit-config.yaml

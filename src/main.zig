@@ -1,71 +1,180 @@
 const std = @import("std");
-const Io = std.Io;
+const HttpClient = @import("HttpClient.zig");
+const vaxis = @import("vaxis");
+const Color = vaxis.Color;
+const v = vaxis.vxfw;
+const redir_buf_size = 8000;
 
-const matrix_client = @import("matrix_client");
+const ColorScheme = struct {
+    black: Color = .rgbFromUint(0x0e1013),
+    bg0: Color = .rgbFromUint(0x1f2329),
+    bg1: Color = .rgbFromUint(0x282c34),
+    bg2: Color = .rgbFromUint(0x30363f),
+    bg3: Color = .rgbFromUint(0x323641),
+    bg_d: Color = .rgbFromUint(0x181b20),
+    bg_blue: Color = .rgbFromUint(0x61afef),
+    bg_yellow: Color = .rgbFromUint(0xe8c88c),
+    fg: Color = .rgbFromUint(0xa0a8b7),
+    purple: Color = .rgbFromUint(0xbf68d9),
+    green: Color = .rgbFromUint(0x8ebd6b),
+    orange: Color = .rgbFromUint(0xcc9057),
+    blue: Color = .rgbFromUint(0x4fa6ed),
+    yellow: Color = .rgbFromUint(0xe2b86b),
+    cyan: Color = .rgbFromUint(0x48b0bd),
+    red: Color = .rgbFromUint(0xe55561),
+    grey: Color = .rgbFromUint(0x535965),
+    light_grey: Color = .rgbFromUint(0x7a818e),
+    dark_cyan: Color = .rgbFromUint(0x266269),
+    dark_red: Color = .rgbFromUint(0x8b3434),
+    dark_yellow: Color = .rgbFromUint(0x835d1a),
+    dark_purple: Color = .rgbFromUint(0x7e3992),
+};
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+const A = struct {
+    server: []const u8,
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    pub fn init(arena: *std.heap.ArenaAllocator, parsed: *std.json.Value) !std.json.Parsed(A) {
+        return .{
+            .arena = arena,
+            .value = .{
+                .server = (parsed.object.get("m.server") orelse return error.MissingRequiredField).string,
+            },
+        };
     }
 
-    // In order to do I/O operations need an `Io` instance.
+    pub fn deinit(this: A, gpa: std.mem.Allocator) void {
+        gpa.free(this.server);
+    }
+};
+
+fn getVoidarcMatrixServer(gpa: std.mem.Allocator, io: std.Io) !HttpClient.Response(A) {
+    var client = try HttpClient.init(gpa, io);
+    defer client.deinit();
+    const res = try client.requestJsonBodyless(A, .GET, try .parse("https://unredacted.org/.well-known/matrix/server"), true);
+    return res;
+}
+test "get voidarc well-known server" {
+    const res = try getVoidarcMatrixServer(std.testing.allocator, std.testing.io);
+    try std.testing.expect(res == .success);
+    switch (res) {
+        .success => |a| {
+            std.log.debug("{s}", .{a.value.server});
+            try std.testing.expectEqualSlices(u8, "matrix.voidarc.co.uk:443", a.value.server);
+        },
+        .err => |err| {
+            std.log.debug("{s}", .{err.value.err});
+        },
+    }
+}
+
+const Event = union(enum) {
+    key_press: vaxis.Key,
+    winsize: vaxis.Winsize,
+    focus_in,
+    get: HttpClient.Response(A),
+};
+
+const Queue = @FieldType(vaxis.Loop(Event), "queue");
+
+fn addToQueue(q: *Queue, gpa: std.mem.Allocator, io: std.Io) !void {
+    const res = try getVoidarcMatrixServer(gpa, io);
+    errdefer res.deinit();
+    try q.push(.{ .get = res });
+}
+
+
+pub fn main(init: std.process.Init) !void {
     const io = init.io;
+    const gpa = init.gpa;
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    var buf: [1024]u8 = undefined;
+    var tty = try vaxis.Tty.init(io, &buf);
+    defer tty.deinit();
 
-    try matrix_client.printAnotherMessage(stdout_writer);
+    var vx = try vaxis.init(io, gpa, init.environ_map, .{});
+    defer vx.deinit(gpa, tty.writer());
 
-    try stdout_writer.flush(); // Don't forget to flush!
-}
+    var loop = vaxis.Loop(Event).init(io, &tty, &vx);
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    try loop.start();
+    defer loop.stop();
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
+    try vx.enterAltScreen(tty.writer());
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try command `zig build test --fuzz -Doptimize=ReleaseFast` to see if it manages to fail this test case!
+    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
 
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+    const scheme: ColorScheme = .{};
+
+    var input = vaxis.widgets.TextInput.init(gpa);
+    defer input.deinit();
+    var input_focused = false;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var fut = io.async(addToQueue, .{ &loop.queue, gpa, io });
+    defer fut.cancel(io) catch {};
+
+
+    while (true) {
+        const e = try loop.nextEvent();
+        _ = arena.reset(.free_all);
+        if (e == .winsize) {
+            try vx.resize(gpa, tty.writer(), e.winsize);
+        }
+
+        const win = vx.window();
+        win.clear();
+
+        switch (e) {
+            .key_press => |key| {
+                if (input_focused) blk: {
+                    if (key.matchExact(vaxis.Key.escape, .{})) {
+                        input_focused = false;
+                        win.hideCursor();
+                        break :blk;
+                    }
+                    try input.update(.{ .key_press = key });
+                } else {
+                    if (key.matchExact('q', .{})) {
+                        break;
+                    } else if (key.matchExact('i', .{})) {
+                        input_focused = true;
+                    }
+                }
+            },
+            .get => |res| {
+                defer res.deinit();
+                switch (res) {
+                    .success => |a| {
+                        input.clearRetainingCapacity();
+                        try input.insertSliceAtCursor(a.value.server);
+                        vx.queueRefresh();
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+
+        const child = win.child(.{
+            .x_off = (win.width / 2) - 15,
+            .y_off = (win.height / 2) - 3,
+            .width = 30,
+            .height = 3,
+            .border = .{
+                .where = .all,
+                .style = .{
+                    .fg = if (input_focused) scheme.cyan else scheme.grey,
+                },
+            },
+        });
+
+        input.draw(child);
+        if (!input_focused) {
+            win.hideCursor();
+        }
+
+        try vx.render(tty.writer());
+    }
 }
