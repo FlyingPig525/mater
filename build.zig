@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const v_mod = v.module("vaxis");
 
     const exe = b.addExecutable(.{
-        .name = "matrix_client",
+        .name = "mater",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
