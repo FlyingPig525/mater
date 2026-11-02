@@ -8,7 +8,7 @@ const redirect_buf_size = 8000;
 client: std.http.Client,
 gpa: std.mem.Allocator,
 
-pub fn init(gpa: std.mem.Allocator, io: std.Io) !HttpClient {
+pub fn init(gpa: std.mem.Allocator, io: std.Io) HttpClient {
     return .{
         .client = .{
             .allocator = gpa,
@@ -46,7 +46,9 @@ pub fn requestJsonBodyless(this: *HttpClient, comptime T: type, method: std.http
     var decomp: std.http.Decompress = undefined;
     const decomp_buf = try this.gpa.alloc(u8, res.head.content_encoding.minBufferCapacity());
     defer this.gpa.free(decomp_buf);
-    const reader = res.readerDecompressing(undefined, &decomp, decomp_buf);
+    // why does allocRemaining need a buffer???
+    var pointless_buf: [64]u8 = undefined;
+    const reader = res.readerDecompressing(&pointless_buf, &decomp, decomp_buf);
     const body = try reader.allocRemaining(this.gpa, .unlimited);
     defer this.gpa.free(body);
     const class = res.head.status.class();

@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 const Color = vaxis.Color;
 const LabelledWindow = @import("LabelledWindow.zig");
 const v = vaxis.vxfw;
+const Parsed = std.json.Parsed;
 const redir_buf_size = 8000;
 
 const ColorScheme = struct {
@@ -36,7 +37,7 @@ const WellKnownClientInfo = struct {
     homeserver: []const u8,
     identity_server: ?[]const u8,
 
-    pub fn init(arena: *std.heap.ArenaAllocator, parsed: *std.json.Value) !std.json.Parsed(WellKnownClientInfo) {
+    pub fn init(arena: *std.heap.ArenaAllocator, parsed: *std.json.Value) !Parsed(WellKnownClientInfo) {
         if (parsed.* != .object) return error.MissingRequiredField;
         const obj = parsed.object;
         const h = obj.get("m.homeserver") orelse return error.MissingRequiredField;
@@ -59,11 +60,72 @@ const WellKnownClientInfo = struct {
             },
         };
     }
+
+    pub fn clone(this: WellKnownClientInfo, gpa: std.mem.Allocator) !WellKnownClientInfo {
+        return .{
+            .homeserver = try gpa.dupe(u8, this.homeserver),
+            .identity_server = if (this.identity_server) |i| try gpa.dupe(u8, i) else null,
+        };
+    }
+};
+
+const SupportedVersions = struct {
+    versions: []const MatrixVersion,
+    unstable_features: ?[][]const u8,
+
+    // needed because of unstable_features
+    pub fn init(arena: *std.heap.ArenaAllocator, parsed: *std.json.Value) !Parsed(SupportedVersions) {
+        if (parsed.* != .object) return error.MissingRequiredField;
+        const obj = parsed.object;
+        const versions = obj.get("versions") orelse return error.MissingRequiredField;
+        if (versions != .array) return error.MissingRequiredField;
+        const arr = try arena.allocator().alloc(MatrixVersion, versions.array.items.len);
+        for (versions.array.items, 0..) |value, i| {
+            if (value != .string) return error.InvalidType;
+            arr[i] = try .parse(value.string);
+        }
+        var unstable: ?[][]const u8 = undefined;
+        if (obj.get("unstable_features")) |u| {
+            if (u != .object) return error.MissingRequiredField;
+            unstable = try arena.allocator().alloc([]const u8, u.object.keys().len);
+            var iter = u.object.iterator();
+            var i: usize = 0;
+            while (iter.next()) |entry| : (i += 1) {
+                if (entry.value_ptr.bool) {
+                    unstable[i] = arena.allocator().dupe(u8, entry.key_ptr.*);
+                }
+            }
+        }
+
+        return .{
+            .arena = arena,
+            .value = .{
+                .versions = arr,
+                .unstable_features = unstable,
+            },
+        };
+    }
+
+    pub fn clone(this: SupportedVersions, gpa: std.mem.Allocator) !SupportedVersions {
+        const versions = try gpa.dupe(MatrixVersion, this.versions);
+        var unstable: ?[][]const u8 = null;
+        if (this.unstable_features) |features| {
+            unstable = try gpa.alloc([]const u8, features.len);
+            for (features, 0..) |feature, i| {
+                unstable.?[i] = try gpa.dupe(u8, feature);
+            }
+        }
+
+        return .{
+            .versions = versions,
+            .unstable_features = unstable,
+        };
+    }
 };
 const A = struct {
     server: []const u8,
 
-    pub fn init(arena: *std.heap.ArenaAllocator, parsed: *std.json.Value) !std.json.Parsed(A) {
+    pub fn init(arena: *std.heap.ArenaAllocator, parsed: *std.json.Value) !Parsed(A) {
         return .{
             .arena = arena,
             .value = .{
@@ -78,18 +140,19 @@ const A = struct {
 };
 
 fn getVoidarcMatrixServer(gpa: std.mem.Allocator, io: std.Io) !HttpClient.Response(A) {
-    var client = try HttpClient.init(gpa, io);
+    var client = HttpClient.init(gpa, io);
     defer client.deinit();
     const res = try client.requestJsonBodyless(A, .GET, try .parse("https://unredacted.org/.well-known/matrix/server"), true);
     return res;
 }
 test "get voidarc well-known server" {
     const res = try getVoidarcMatrixServer(std.testing.allocator, std.testing.io);
+    defer res.deinit();
     try std.testing.expect(res == .success);
     switch (res) {
         .success => |a| {
             std.log.debug("{s}", .{a.value.server});
-            try std.testing.expectEqualSlices(u8, "matrix.voidarc.co.uk:443", a.value.server);
+            try std.testing.expectEqualSlices(u8, "matrix.unredacted.org:8448", a.value.server);
         },
         .err => |err| {
             std.log.debug("{s}", .{err.value.err});
@@ -131,6 +194,8 @@ pub fn Focus(comptime T: type) type {
 const MatrixId = struct {
     username: []const u8,
     homeserver: std.Uri,
+    // uris require their original string that was parsed to live as long as the uri lives >:(
+    homeserver_string: []const u8,
     gpa: std.mem.Allocator,
 
     const max_len = 255;
@@ -149,18 +214,88 @@ const MatrixId = struct {
         return .{
             .username = try gpa.dupe(u8, split.@"0"),
             .homeserver = uri,
+            .homeserver_string = homeserver,
             .gpa = gpa,
         };
     }
 
     pub fn deinit(this: MatrixId) void {
         this.gpa.free(this.username);
+        this.gpa.free(this.homeserver_string);
     }
 };
 
-const LoginScreen = struct {
+const MatrixVersion = struct {
+    major: u8,
+    minor: u8,
+    /// if patch is non-null, this version is legacy
+    patch: ?u8 = null,
+
+    pub fn isLegacy(this: MatrixVersion) bool {
+        return this.patch != null;
+    }
+    const ParseError = error{ UnrecognizedScheme, InvalidVersion, InvalidInt, SliceTooSmall };
+    /// Parses a version string, ignoring all content once enough values have been extracted.
+    ///
+    /// `MatrixVersion.parse("v1.1.1.1.1")` => `MatrixVersion{ .major = 1, .minor = 1 }`
+    pub fn parse(str: []const u8) ParseError!MatrixVersion {
+        if (str.len < 4) return ParseError.SliceTooSmall;
+        const scheme = str[0];
+        switch (scheme) {
+            'v' => {
+                var tokenized = std.mem.tokenizeScalar(u8, str[1..], '.');
+                var i: u8 = 0;
+                var arr: [2]u8 = [2]u8{ 0, 0 };
+                while (tokenized.next()) |token| : (i += 1) {
+                    if (i >= 2) break;
+                    arr[i] = std.fmt.parseInt(u8, token, 10) catch return ParseError.InvalidInt;
+                }
+                if (i <= 1) return ParseError.InvalidVersion;
+                return fromSlice(&arr, false);
+            },
+            'r' => {
+                var tokenized = std.mem.tokenizeScalar(u8, str[1..], '.');
+                var i: u8 = 0;
+                var arr: [3]u8 = @splat(0);
+                while (tokenized.next()) |token| : (i += 1) {
+                    if (i >= 3) break;
+                    arr[i] = std.fmt.parseInt(u8, token, 10) catch return ParseError.InvalidInt;
+                }
+                if (i <= 2) return ParseError.InvalidVersion;
+                return fromSlice(&arr, true);
+            },
+            else => return ParseError.UnrecognizedScheme,
+        }
+    }
+
+    pub fn fromSlice(arr: []const u8, legacy: bool) ParseError!MatrixVersion {
+        if (legacy) {
+            if (arr.len < 3) return ParseError.SliceTooSmall;
+            return .{ .major = arr[0], .minor = arr[1], .patch = arr[2] };
+        } else {
+            if (arr.len < 2) return ParseError.SliceTooSmall;
+            return .{ .major = arr[0], .minor = arr[1] };
+        }
+    }
+};
+
+const InfoCache = struct {
+    arena: std.heap.ArenaAllocator,
+    id: MatrixId,
+    versions: SupportedVersions,
+    well_known: WellKnownClientInfo,
+
+    pub fn deinit(this: InfoCache) void {
+        this.arena.deinit();
+    }
+};
+
+var cache: ?InfoCache = null;
+
+const LegacyLoginScreen = struct {
     username: Focus(widgets.TextInput),
     password: Focus(widgets.TextInput),
+    homeserver: []const u8,
     scheme: *const ColorScheme,
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -169,29 +304,31 @@ const LoginScreen = struct {
     status: Status = .awaiting_submission,
     locked: bool = false,
 
-    pub const LoginEvent = union(enum) {
-        status: Status,
-    };
-
     pub const Status = union(enum) {
         awaiting_submission,
         parsing,
         requesting,
         checking_version,
+        authenticating,
+        done: InfoCache,
         // should always be used with @errorName so i dont have to do memory management
         err: []const u8,
-        network_err: std.json.Parsed(Error),
+        network_err: Parsed(Error),
 
         const awaiting_text: []const u8 = "[s]ubmit";
         const parsing_text = "Parsing ID";
         const requesting_text = "Requesting client details";
         const checking_text = "Checking homeserver versions";
+        const authenticating_text = "Authenticating";
+        const done_text = "Done";
         pub fn text(this: Status) []const u8 {
             return switch (this) {
                 .awaiting_submission => awaiting_text,
                 .parsing => parsing_text,
                 .requesting => requesting_text,
                 .checking_version => checking_text,
+                .authenticating => authenticating_text,
+                .done => done_text,
                 .err => |str| str,
                 .network_err => |err| err.value.err_code_str,
             };
@@ -203,10 +340,11 @@ const LoginScreen = struct {
             }
         }
     };
-    pub fn init(gpa: std.mem.Allocator, scheme: *const ColorScheme, io: std.Io, queue: *Queue) !LoginScreen {
+    pub fn init(gpa: std.mem.Allocator, homeserver: []const u8, scheme: *const ColorScheme, io: std.Io, queue: *Queue) !LegacyLoginScreen {
         return .{
             .username = .init(.init(gpa)),
             .password = .init(.init(gpa)),
+            .homeserver = homeserver,
             .gpa = gpa,
             .scheme = scheme,
             .io = io,
@@ -214,7 +352,7 @@ const LoginScreen = struct {
         };
     }
 
-    pub fn deinit(this: *LoginScreen) void {
+    pub fn deinit(this: *LegacyLoginScreen) void {
         if (this.req) |*req| {
             req.cancel(this.io);
         }
@@ -222,11 +360,11 @@ const LoginScreen = struct {
         this.password.widget.deinit();
     }
 
-    pub fn focused(this: *const LoginScreen) bool {
+    pub fn focused(this: *const LegacyLoginScreen) bool {
         return this.username.focused or this.password.focused;
     }
 
-    pub fn update(this: *LoginScreen, e: Event) !bool {
+    pub fn update(this: *LegacyLoginScreen, e: Event) !bool {
         switch (e) {
             .key_press => |key| {
                 if (key.matchExact(vaxis.Key.escape, .{})) {
@@ -246,27 +384,30 @@ const LoginScreen = struct {
                 }
                 if (key.matchExact('q', .{}) and !this.focused()) {
                     return false;
-                } else if (key.matchExact('u', .{})) {
+                } else if (key.matchExact('u', .{}) and !this.focused()) {
                     this.username.focused = true;
-                } else if (key.matchExact('p', .{})) {
+                } else if (key.matchExact('p', .{}) and !this.focused()) {
                     this.password.focused = true;
-                } else if (key.matchExact('s', .{}) and this.status == .awaiting_submission) {
+                } else if (key.matchExact('s', .{}) and this.status == .awaiting_submission and !this.focused()) {
+                    this.username.focused = false;
+                    this.password.focused = false;
                     if (this.req) |*req| {
                         req.cancel(this.io);
                     }
-                    this.status = .parsing;
                     this.locked = true;
-                    this.req = this.io.async(submitWrapper, .{ this.queue, this.io, this.gpa, try this.username.widget.toOwnedContents(this.gpa), try this.password.widget.toOwnedContents(this.gpa) });
+                    this.status = .parsing;
+                    this.req = this.io.async(submitWrapper, .{ this.queue, this.io, this.gpa, this.homeserver, try this.username.widget.toOwnedContents(this.gpa), try this.password.widget.toOwnedContents(this.gpa) });
                 }
             },
-            .login => |lE| {
-                switch (lE) {
-                    .status => |status| {
+            .login => |login| {
+                switch (login) {
+                    .legacy => |status| {
                         this.status = status;
                         if (status == .err or status == .network_err) {
                             this.locked = false;
                         }
                     },
+                    else => {},
                 }
             },
             else => {},
@@ -275,42 +416,64 @@ const LoginScreen = struct {
         return true;
     }
 
-    fn submitWrapper(q: *Queue, io: std.Io, gpa: std.mem.Allocator, username: []const u8, password: []const u8) void {
-        submit(q, io, gpa, username, password) catch |err| {
-            q.push(.{ .login = .{ .status = .{ .err = @errorName(err) } } }) catch return;
+    fn submitWrapper(q: *Queue, io: std.Io, gpa: std.mem.Allocator, homeserver: []const u8, username: []const u8, password: []const u8) void {
+        submit(q, io, gpa, homeserver, username, password) catch |err| {
+            if (err == error.Ignore) return;
+            q.push(.{ .login = .{ .legacy = .{ .err = @errorName(err) } } }) catch return;
         };
     }
-    fn submit(q: *Queue, io: std.Io, gpa: std.mem.Allocator, username: []const u8, password: []const u8) !void {
+    fn submit(q: *Queue, io: std.Io, gpa: std.mem.Allocator, homeserver: []const u8, username: []const u8, password: []const u8) !void {
         defer {
             gpa.free(username);
             gpa.free(password);
         }
-        const parsed = try MatrixId.parse(gpa, username);
-        defer parsed.deinit();
+        var persistent_arena = std.heap.ArenaAllocator.init(gpa);
+        const persist = persistent_arena.allocator();
 
-        q.push(.{ .login = .{ .status = .requesting } }) catch return;
-        var client = try HttpClient.init(gpa, io);
-        defer client.deinit();
+        const str = try std.mem.concat(gpa, u8, &.{ username, ":", homeserver });
+        defer gpa.free(str);
+        const parsed = try MatrixId.parse(persist, str);
 
-        const well_known_uri = try std.fmt.allocPrint(gpa, "{f}/.well-known/matrix/client", .{ parsed.homeserver });
+        q.push(.{ .login = .{ .legacy = .requesting } }) catch return;
+
+        var client_arena = std.heap.ArenaAllocator.init(gpa);
+        var client = HttpClient.init(client_arena.allocator(), io);
+        defer client_arena.deinit();
+
+        const well_known_uri = try std.fmt.allocPrint(gpa, "{f}.well-known/matrix/client", .{parsed.homeserver});
         defer gpa.free(well_known_uri);
-        const client_info = try client.requestJsonBodyless(WellKnownClientInfo, .GET, std.Uri.parse(well_known_uri) catch return, true);
-        switch (client_info) {
-            .success => |info| {
-                defer client_info.deinit();
-                std.log.debug("{s}", .{ info.value.homeserver });
-            },
-            // err deinit happens when status get overridden
-            .err => |err| {
-                try q.push(.{ .login = .{ .status = .{ .network_err = err } } });
-            },
+        const client_info = try client.requestJsonBodyless(WellKnownClientInfo, .GET, try std.Uri.parse(well_known_uri), true);
+        if (client_info == .err) {
+            try q.push(.{ .login = .{ .legacy = .{ .network_err = client_info.err } } });
+            return error.Ignore;
         }
+        const info = try client_info.success.value.clone(persist);
+
+        try q.push(.{ .login = .{ .legacy = .checking_version } });
+
+        const version_uri = try std.fmt.allocPrint(gpa, "{s}/_matrix/client/versions", .{info.homeserver});
+        defer gpa.free(version_uri);
+
+        const version_res = try client.requestJsonBodyless(SupportedVersions, .GET, try std.Uri.parse(version_uri), true);
+        if (version_res == .err) {
+            try q.push(.{ .login = .{ .legacy = .{ .network_err = version_res.err } } });
+            return error.Ignore;
+        }
+        const versions = try version_res.success.value.clone(persist);
+
+        try q.push(.{ .login = .{ .legacy = .authenticating } });
+        try q.push(.{ .login = .{ .legacy = .{ .done = .{
+            .arena = persistent_arena,
+            .id = parsed,
+            .versions = versions,
+            .well_known = info,
+        } } } });
     }
 
-    pub fn draw(this: *LoginScreen, _: std.mem.Allocator, win: vaxis.Window) !void {
+    pub fn draw(this: *LegacyLoginScreen, _: std.mem.Allocator, win: vaxis.Window) !void {
         if (win.height < 7) return error.WindowTooSmall;
         const spacing = @divFloor((win.height - 6), 3);
-        var user_win = LabelledWindow.init("[u]sername (fully-qualified)", if (this.username.focused) this.scheme.cyan else this.scheme.fg, win, .{
+        var user_win = LabelledWindow.init("[u]sername", if (this.username.focused) this.scheme.cyan else this.scheme.fg, win, .{
             .x_off = 1,
             .y_off = spacing,
             .width = win.width - 2,
@@ -363,7 +526,319 @@ const LoginScreen = struct {
     }
 };
 
+const HomeserverScreen = struct {
+    homeserver: Focus(widgets.TextInput),
+    scheme: *const ColorScheme,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    queue: *Queue,
+    req: ?std.Io.Future(void) = null,
+    status: Status = .awaiting_submission,
+    locked: bool = false,
+
+    pub const Status = union(enum) {
+        awaiting_submission,
+        checking_capabilities,
+        done: struct { oauth: bool, legacy: bool },
+        // should always be used with @errorName so i dont have to do memory management
+        err: []const u8,
+        network_err: Parsed(Error),
+
+        const awaiting_text: []const u8 = "[s]ubmit";
+        const capability_text = "Checking capabilities";
+        const done_text = "Done";
+        pub fn text(this: Status) []const u8 {
+            return switch (this) {
+                .awaiting_submission => awaiting_text,
+                .checking_capabilities => capability_text,
+                .done => done_text,
+                .err => |str| str,
+                .network_err => |err| err.value.err_code_str,
+            };
+        }
+
+        pub fn deinit(this: Status) void {
+            if (this == .network_err) {
+                this.network_err.deinit();
+            }
+        }
+    };
+
+    pub fn init(gpa: std.mem.Allocator, scheme: *const ColorScheme, io: std.Io, queue: *Queue) !HomeserverScreen {
+        return .{
+            .homeserver = .init(.init(gpa)),
+            .gpa = gpa,
+            .scheme = scheme,
+            .io = io,
+            .queue = queue,
+        };
+    }
+
+    pub fn deinit(this: *HomeserverScreen) void {
+        if (this.req) |*req| {
+            req.cancel(this.io);
+        }
+        this.homeserver.widget.deinit();
+    }
+
+    pub fn focused(this: *const HomeserverScreen) bool {
+        return this.homeserver.focused;
+    }
+
+    pub fn update(this: *HomeserverScreen, e: Event) !bool {
+        switch (e) {
+            .key_press => |key| {
+                if (key.matchExact(vaxis.Key.escape, .{})) {
+                    this.homeserver.focused = false;
+                }
+                if (!this.locked) {
+                    if (this.homeserver.focused) {
+                        try this.homeserver.widget.update(.{ .key_press = key });
+                        this.status.deinit();
+                        this.status = .awaiting_submission;
+                    }
+                }
+                if (key.matchExact('q', .{}) and !this.focused()) {
+                    return false;
+                } else if (key.matchExact('h', .{})) {
+                    this.homeserver.focused = true;
+                } else if (key.matchExact('s', .{}) and this.status == .awaiting_submission) {
+                    this.homeserver.focused = false;
+                    if (this.req) |*req| {
+                        req.cancel(this.io);
+                    }
+                    this.locked = true;
+                    this.status = .checking_capabilities;
+                    this.req = this.io.async(homeserverSubmitWrapper, .{ this.queue, this.io, this.gpa, try this.homeserver.widget.toOwnedContents(this.gpa) });
+                }
+            },
+            .login => |login| {
+                switch (login) {
+                    .homeserver => |status| {
+                        this.status = status;
+                        if (status == .err or status == .network_err) {
+                            this.locked = false;
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+
+        return true;
+    }
+
+    fn homeserverSubmitWrapper(q: *Queue, io: std.Io, gpa: std.mem.Allocator, homeserver: []const u8) void {
+        homeserverSubmit(q, io, gpa, homeserver) catch |err| {
+            if (err == error.Ignore) return;
+            q.push(.{ .login = .{ .homeserver = .{ .err = @errorName(err) } } }) catch return;
+        };
+    }
+
+    fn homeserverSubmit(q: *Queue, io: std.Io, gpa: std.mem.Allocator, homeserver: []const u8) !void {
+        _ = io;
+        defer gpa.free(homeserver);
+
+        // TODO: actually check whether to use oauth or legacy
+        try q.push(.{ .login = .{ .homeserver = .{ .done = .{ .oauth = false, .legacy = true } } } });
+    }
+
+    pub fn draw(this: *HomeserverScreen, _: std.mem.Allocator, win: vaxis.Window) !void {
+        if (win.height < 7) return error.WindowTooSmall;
+        const spacing = @divFloor((win.height - 6), 3);
+        const hs_win = LabelledWindow.init("[h]omeserver", if (this.homeserver.focused) this.scheme.cyan else this.scheme.fg, win, .{
+            .x_off = 1,
+            .y_off = spacing,
+            .width = win.width - 2,
+            .height = 3,
+            .border = .{
+                .where = .all,
+                .style = .{
+                    .fg = if (this.homeserver.focused) this.scheme.cyan else this.scheme.grey,
+                },
+            },
+        });
+        this.homeserver.widget.draw(hs_win);
+        if (!this.homeserver.focused) {
+            win.hideCursor();
+        }
+        const text = this.status.text();
+        const info_win = win.child(.{
+            .x_off = (win.width / 2) - @as(u16, @intCast(text.len / 2)),
+            .y_off = 5 + (spacing * 3),
+            .width = win.width,
+            .height = 1,
+        });
+
+        _ = info_win.printSegment(
+            .{
+                .text = text,
+                .style = .{ .fg = if (this.status != .err) this.scheme.green else this.scheme.red },
+            },
+            .{},
+        );
+    }
+};
+
+// TODO: split this into a manager and individual screens for oauth and legacy and homeserver input
+const LoginScreen = struct {
+    homeserver_screen: ?HomeserverScreen,
+    legacy: ?LegacyLoginScreen = null,
+    homeserver: ?[]const u8 = null,
+
+    scheme: *const ColorScheme,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    queue: *Queue,
+
+    pub const LoginEvent = union(enum) {
+        legacy: LegacyLoginScreen.Status,
+        homeserver: HomeserverScreen.Status,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, scheme: *const ColorScheme, io: std.Io, queue: *Queue) !LoginScreen {
+        return .{
+            .homeserver_screen = try .init(gpa, scheme, io, queue),
+            .scheme = scheme,
+            .io = io,
+            .gpa = gpa,
+            .queue = queue,
+        };
+    }
+    pub fn deinit(this: *LoginScreen) void {
+        if (this.homeserver) |hs| {
+            this.gpa.free(hs);
+        }
+        if (this.homeserver_screen) |*hs| {
+            hs.deinit();
+        }
+        if (this.legacy) |*l| {
+            l.deinit();
+        }
+    }
+
+    pub fn focused(this: *const LoginScreen) bool {
+        return (if (this.homeserver_screen) |h| h.focused() else false) or (if (this.legacy) |l| l.focused() else false);
+    }
+
+    pub fn update(this: *LoginScreen, e: Event) !bool {
+        switch (e) {
+            .key_press => |key| {
+                if (key.matchExact('q', .{}) and !this.focused()) {
+                    return false;
+                }
+            },
+            .login => |login| {
+                switch (login) {
+                    .legacy => |status| {
+                        _ = try this.legacy.?.update(e);
+                        if (status == .done) {
+                            cache = status.done;
+                            return true;
+                        }
+                    },
+                    .homeserver => |status| {
+                        if (status == .done) {
+                            if (this.homeserver) |hs| {
+                                this.gpa.free(hs);
+                            }
+                            this.homeserver = try this.homeserver_screen.?.homeserver.widget.toOwnedContents(this.gpa);
+                            this.homeserver_screen.?.deinit();
+                            this.homeserver_screen = null;
+                            this.legacy = try .init(this.gpa, this.homeserver.?, this.scheme, this.io, this.queue);
+                            return true;
+                        }
+                    },
+                }
+            },
+            else => {},
+        }
+        if (this.homeserver_screen) |*h| {
+            _ = try h.update(e);
+        } else if (this.legacy) |*l| {
+            _ = try l.update(e);
+        }
+
+        return true;
+    }
+
+    pub fn draw(this: *LoginScreen, alloc: std.mem.Allocator, win: vaxis.Window) !void {
+        if (win.height < 7) return error.WindowTooSmall;
+        if (this.homeserver_screen) |*h| {
+            try h.draw(alloc, win);
+        } else if (this.legacy) |*l| {
+            try l.draw(alloc, win);
+        }
+    }
+};
+
+test "unredacted" {
+    const testing = std.testing;
+    var client = try HttpClient.init(testing.allocator, testing.io);
+    defer client.deinit();
+
+    const res = try client.requestJsonBodyless(WellKnownClientInfo, .GET, try std.Uri.parse("https://unredacted.org/.well-known/matrix/client"), true);
+    defer res.deinit();
+    try testing.expect(res != .err);
+}
+
+test "submit" {
+    std.testing.allocator_instance.stack_trace_size = 15;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const username = "flyingpig525:unredacted.org";
+    const password = "my_totally_real_password";
+
+    var q = Queue.init(io);
+    const colors = ColorScheme{};
+    var screen = try LoginScreen.init(gpa, &colors, io, &q);
+    defer screen.deinit();
+
+    try q.push(.{ .key_press = .{ .codepoint = 'u' } });
+    try q.push(.{ .key_press = .{ .text = try gpa.dupe(u8, username), .codepoint = '0' } });
+
+    try q.push(.{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+
+    try q.push(.{ .key_press = .{ .codepoint = 'p' } });
+    try q.push(.{ .key_press = .{ .text = try gpa.dupe(u8, password), .codepoint = '0' } });
+
+    try q.push(.{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+    try q.push(.{ .key_press = .{ .codepoint = 's' } });
+
+    var done = false;
+    while (!done) {
+        // if .done is never sent, this will hang forever :( im too lazy to make it time out
+        const e = try q.pop();
+        defer {
+            if (e == .key_press) {
+                if (e.key_press.text) |t| {
+                    gpa.free(t);
+                }
+            }
+        }
+        if (e == .login) {
+            if (e.login.status == .done) {
+                done = true;
+                e.login.status.done.deinit();
+            }
+            try std.testing.expect(e.login.status != .err);
+            try std.testing.expect(e.login.status != .network_err);
+        }
+        _ = try screen.update(e);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
+    defer if (cache) |c| {
+        defer c.deinit();
+        // const file = std.Io.Dir.createFile(.cwd(), init.io, "cache", .{}) catch break :blk;
+        // defer file.close(init.io);
+        // var buf: [64]u8 = undefined;
+        // var writer = file.writer(init.io, &buf);
+        // writer.interface.print("{f}", .{std.json.fmt(c, .{})}) catch break :blk;
+    };
     const io = init.io;
     const gpa = init.gpa;
 
