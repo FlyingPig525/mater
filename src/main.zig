@@ -8,7 +8,6 @@ const v = vaxis.vxfw;
 const Parsed = std.json.Parsed;
 const redir_buf_size = 8000;
 
-
 const ColorScheme = struct {
     black: Color = .rgbFromUint(0x0e1013),
     bg0: Color = .rgbFromUint(0x1f2329),
@@ -592,15 +591,15 @@ const LegacyLoginScreen = struct {
                     this.username.focused = true;
                 } else if (key.matchExact('p', .{}) and !this.focused()) {
                     this.password.focused = true;
-                } else if (((key.matchExact('s', .{}) and !this.focused()) or key.matchExact(vaxis.Key.enter, .{})) and this.status == .awaiting_submission) {
-                    this.username.focused = false;
-                    this.password.focused = false;
-                    if (this.req) |*req| {
-                        req.cancel(this.io);
+                } else if (key.matchExact(vaxis.Key.enter, .{}) and !this.locked) {
+                    if (this.username.focused) {
+                        this.username.focused = false;
+                        this.password.focused = true;
+                    } else {
+                        try this.doSubmit();
                     }
-                    this.locked = true;
-                    this.status = .parsing;
-                    this.req = this.io.async(submitWrapper, .{ this.queue, this.io, this.gpa, this.homeserver, try this.username.widget.toOwnedContents(this.gpa), try this.password.widget.toOwnedContents(this.gpa) });
+                } else if ((key.matchExact('s', .{}) and !this.focused()) or key.matchExact(vaxis.Key.enter, .{})) {
+                    try this.doSubmit();
                 }
             },
             .login => |login| {
@@ -619,6 +618,17 @@ const LegacyLoginScreen = struct {
         }
 
         return true;
+    }
+    fn doSubmit(this: *LegacyLoginScreen) !void {
+        if (this.status != .awaiting_submission) return;
+        this.username.focused = false;
+        this.password.focused = false;
+        if (this.req) |*req| {
+            req.cancel(this.io);
+        }
+        this.locked = true;
+        this.status = .parsing;
+        this.req = this.io.async(submitWrapper, .{ this.queue, this.io, this.gpa, this.homeserver, try this.username.widget.toOwnedContents(this.gpa), try this.password.widget.toOwnedContents(this.gpa) });
     }
 
     inline fn trace() ?std.builtin.StackTrace {
@@ -1223,7 +1233,9 @@ test "submit" {
                 }
             }
             try std.testing.expect(e.login.legacy != .err);
-            try std.testing.expect(e.login.legacy != .network_err);
+            if (e.login.legacy == .network_err) {
+                try std.testing.expect(e.login.legacy.network_err.err_code == .forbidden);
+            }
         }
     }
 }
