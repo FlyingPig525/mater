@@ -3,4 +3,5 @@ zig-out/
 .devenv
 zig-pkg/
 log.log
-
+cache
+cache.json

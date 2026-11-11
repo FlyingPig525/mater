@@ -2,11 +2,11 @@
     .name = .mater,
     .version = "0.0.0",
     .fingerprint = 0xd1639bf9b28cef4c, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#bb94364ce00a59044322d3d403d08e83d841d9d4",
-            .hash = "vaxis-0.6.0-BWNV_IoaDQDXEsN4nhfsjQlgU3EfkQqJqTGkAW-vjAi0",
+            .url = "git+https://github.com/rockorager/libvaxis.git#c6c23fbda5b2fb2aa277fe4c02b4efb27bb4e376",
+            .hash = "vaxis-0.6.0-BWNV_PW0DQAHFemkOYfxWOatp7EmUgBajplto8z86mjG",
         },
     },
     .paths = .{
